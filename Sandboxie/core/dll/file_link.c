@@ -259,6 +259,45 @@ _FX FILE_DRIVE *File_GetDriveForLetter(WCHAR drive_letter)
 
 
 //---------------------------------------------------------------------------
+// File_GetGuidForPath
+//---------------------------------------------------------------------------
+
+
+_FX FILE_GUID *File_GetGuidForPath(const WCHAR *Path, ULONG PathLen)
+{
+    FILE_GUID *guid;
+
+    EnterCriticalSection(File_DrivesAndLinks_CritSec);
+
+    guid = List_Head(File_GuidLinks);
+    while (guid) {
+
+        if (PathLen >= guid->len
+                && _wcsnicmp(Path, guid->path, guid->len) == 0) {
+
+            //
+            // make sure access to \Device\HarddiskVolume10 (for M:),
+            // for instance, is not matched by \Device\HarddiskVolume1
+            // (for C:), by requiring a backslash or null character
+            // to follow the matching drive path
+            //
+
+            const WCHAR *ptr = Path + guid->len;
+            if (*ptr == L'\\' || *ptr == L'\0')
+                break;
+        }
+
+        guid = List_Next(guid);
+    }
+
+    if(!guid)
+        LeaveCriticalSection(File_DrivesAndLinks_CritSec);
+
+    return guid;
+}
+
+
+//---------------------------------------------------------------------------
 // File_GetLinkForGuid
 //---------------------------------------------------------------------------
 
@@ -523,6 +562,36 @@ _FX void File_RemovePermLinks(const WCHAR *path)
 
 
 //---------------------------------------------------------------------------
+// File_GetDrivePrefixLength
+//---------------------------------------------------------------------------
+
+
+_FX ULONG File_GetDrivePrefixLength(const WCHAR *work_str, ULONG work_len)
+{
+    ULONG prefix_len = 0;
+
+    if (!FILE_IS_REDIRECTOR_OR_MUP(work_str, work_len)) {
+        const FILE_DRIVE *drive = File_GetDriveForPath(work_str, work_len);
+        if (drive) {
+            prefix_len = drive->len;
+            LeaveCriticalSection(File_DrivesAndLinks_CritSec);
+        }
+        else {
+            const FILE_GUID* guid = File_GetGuidForPath(work_str, work_len);
+            if (guid) {
+                prefix_len = guid->len;
+                LeaveCriticalSection(File_DrivesAndLinks_CritSec);
+            }
+        }
+    }
+
+    if (prefix_len == work_len)
+        prefix_len = 0;
+    return prefix_len;
+}
+
+
+//---------------------------------------------------------------------------
 // File_TranslateTempLinks
 //---------------------------------------------------------------------------
 
@@ -567,20 +636,8 @@ _FX WCHAR *File_TranslateTempLinks(
     // make sure the path is for a local drive
     //
 
-    if (1) {
-        const FILE_DRIVE *drive;
-        if (FILE_IS_REDIRECTOR_OR_MUP(TruePath, TruePath_len))
-            drive = NULL;
-        else
-            drive = File_GetDriveForPath(TruePath, TruePath_len);
-        if (drive) {
-            if (drive->len == TruePath_len)
-                drive = NULL;
-            LeaveCriticalSection(File_DrivesAndLinks_CritSec);
-        }
-        if (! drive)
-            return NULL;
-    }
+    if(!File_GetDrivePrefixLength(TruePath, TruePath_len))
+        return NULL;
 
     ret = NULL;
 
@@ -804,20 +861,8 @@ _FX WCHAR *File_TranslateTempLinks_2(WCHAR *input_str, ULONG input_len)
             // otherwise make sure we are dealing with a local drive
             //
 
-            const FILE_DRIVE *drive;
-            if (FILE_IS_REDIRECTOR_OR_MUP(work_str, work_len))
-                drive = NULL;
-            else {
-                drive = File_GetDriveForPath(work_str, work_len);
-                if (drive) {
-                    prefix_len = drive->len;
-                    LeaveCriticalSection(File_DrivesAndLinks_CritSec);
-                    if (prefix_len == work_len)
-                        drive = NULL;
-                }
-            }
-
-            if (! drive)
+            prefix_len = File_GetDrivePrefixLength(work_str, work_len);
+            if (!prefix_len)
                 break;
         }
 
@@ -991,22 +1036,42 @@ _FX FILE_LINK *File_AddTempLink(WCHAR *path)
 
             if (NT_SUCCESS(status)) {
 
-                WCHAR* input_str = reparseDataBuffer->MountPointReparseBuffer.PathBuffer;
-                if (_wcsnicmp(input_str, L"\\??\\Volume{", 11) == 0)
-                    input_str = File_TranslateGuidToNtPath(reparseDataBuffer->MountPointReparseBuffer.PathBuffer);
-                else if (_wcsnicmp(input_str, File_BQQB, 4) == 0)
-                    input_str = File_TranslateDosToNtPath(reparseDataBuffer->MountPointReparseBuffer.PathBuffer + 4);
+                WCHAR* SubstituteNameBuffer = NULL;
+                //WCHAR* PrintNameBuffer = NULL;
+                BOOL RelativePath = FALSE;
 
-                if (input_str) {
+                if (reparseDataBuffer->ReparseTag == IO_REPARSE_TAG_SYMLINK)
+                {
+                    SubstituteNameBuffer = &reparseDataBuffer->SymbolicLinkReparseBuffer.PathBuffer[reparseDataBuffer->SymbolicLinkReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+                    if (reparseDataBuffer->SymbolicLinkReparseBuffer.Flags & SYMLINK_FLAG_RELATIVE)
+                        RelativePath = TRUE;
+                    SubstituteNameBuffer[reparseDataBuffer->SymbolicLinkReparseBuffer.SubstituteNameLength / sizeof(WCHAR)] = 0;
+                }
+                else if (reparseDataBuffer->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+                {
+                    SubstituteNameBuffer = &reparseDataBuffer->MountPointReparseBuffer.PathBuffer[reparseDataBuffer->MountPointReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+                    SubstituteNameBuffer[reparseDataBuffer->MountPointReparseBuffer.SubstituteNameLength / sizeof(WCHAR)] = 0;
+                }
 
-                    ULONG input_len = wcslen(input_str);
-                    while (input_len > 0 && input_str[input_len - 1] == L'\\')
-                        input_len -= 1; // remove tailing back slash
-                        
-                    newpath = File_TranslateTempLinks_2(input_str, input_len);
+                if (SubstituteNameBuffer && !RelativePath) // todo RelativePath - for now we fall back to UserReparse = FALSE;
+                {
+                    WCHAR* input_str = SubstituteNameBuffer;
+                    if (_wcsnicmp(input_str, L"\\??\\Volume{", 11) == 0)
+                        input_str = File_TranslateGuidToNtPath(SubstituteNameBuffer);
+                    else if (_wcsnicmp(input_str, File_BQQB, 4) == 0)
+                        input_str = File_TranslateDosToNtPath(SubstituteNameBuffer + 4);
 
-                    if (input_str != reparseDataBuffer->MountPointReparseBuffer.PathBuffer)
-                        Dll_Free(input_str);
+                    if (input_str) {
+
+                        ULONG input_len = wcslen(input_str);
+                        while (input_len > 0 && input_str[input_len - 1] == L'\\')
+                            input_len -= 1; // remove trailing backslash
+
+                        newpath = File_TranslateTempLinks_2(input_str, input_len);
+
+                        if (input_str != SubstituteNameBuffer)
+                            Dll_Free(input_str);
+                    }
                 }
 
                 /*THREAD_DATA* TlsData = Dll_GetTlsData(NULL);
@@ -1089,7 +1154,10 @@ _FX FILE_LINK *File_AddTempLink(WCHAR *path)
 
             if (! FILE_IS_REDIRECTOR_OR_MUP(newpath, len) && !bPermLinkPath) {
                 const FILE_DRIVE *drive = File_GetDriveForPath(newpath, len);
-                if (drive) {
+                const FILE_GUID *guid = NULL;
+                if(!drive)
+                    guid = File_GetGuidForPath(newpath, len);
+                if (drive || guid) {
                     LeaveCriticalSection(File_DrivesAndLinks_CritSec);
                     stop = FALSE;
                 }
@@ -1254,15 +1322,15 @@ _FX FILE_LINK *File_FindPermLinksForMatchPath(
     link = List_Head(File_PermLinks);
     while (link) {
 
-        const ULONG dst_len = link->dst_len;
+        const ULONG src_len = link->src_len;
 
         if (
 #ifdef WOW64_FS_REDIR
             link != File_Wow64FileLink &&
 #endif WOW64_FS_REDIR
-            name_len >= dst_len &&
-                (name[dst_len] == L'\\' || name[dst_len] == L'\0') &&
-                _wcsnicmp(name, link->dst, dst_len) == 0) {
+            name_len >= src_len &&
+                (name[src_len] == L'\\' || name[src_len] == L'\0') &&
+                _wcsnicmp(name, link->src, src_len) == 0) {
 
             return link;
         }

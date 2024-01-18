@@ -885,38 +885,47 @@ void CSandMan::OnToolBarMenuItemClicked(const QString& scriptName)
 
 void CSandMan::CreateToolBarConfigMenu(const QList<ToolBarAction>& actions, const QSet<QString>& currentItems)
 {
-	auto m_pToolBarContextMenu = new QMenu(tr("Toolbar Items"), m_pToolBar);
-
-	m_pToolBarContextMenu->addAction(tr("Reset Toolbar"), this, &CSandMan::OnResetToolBarMenuConfig);
-	m_pToolBarContextMenu->addSeparator();
-
-	for (auto sa : actions)
+	static QMenu* m_pToolBarContextMenu = NULL;
+	if (!m_pToolBarContextMenu)
 	{
-		if (sa.scriptName == nullptr) {
-			m_pToolBarContextMenu->addSeparator();
-			continue;
-		}
+		m_pToolBarContextMenu = new QMenu(tr("Toolbar Items"), this);
 
-		QString text = sa.scriptName;
-		if (!sa.nameOverride.isEmpty())
-			text = sa.nameOverride;
-		else if (sa.action)
-			text = sa.action->text();  // tr: already localised
-		else
-			qDebug() << "ERROR: Missing display name for " << sa.scriptName;
+		m_pToolBarContextMenu->addAction(tr("Reset Toolbar"), this, &CSandMan::OnResetToolBarMenuConfig);
+		m_pToolBarContextMenu->addSeparator();
 
-		auto scriptName = sa.scriptName;
-		auto menuAction = m_pToolBarContextMenu->addAction(text, this, [scriptName, this]() {
-			OnToolBarMenuItemClicked(scriptName);
+		for (auto sa : actions)
+		{
+			if (sa.scriptName == nullptr) {
+				m_pToolBarContextMenu->addSeparator();
+				continue;
 			}
-		);
-		menuAction->setCheckable(true);
-		menuAction->setChecked(currentItems.contains(sa.scriptName));
+
+			QString text = sa.scriptName;
+			if (!sa.nameOverride.isEmpty())
+				text = sa.nameOverride;
+			else if (sa.action)
+				text = sa.action->text();  // tr: already localised
+			else
+				qDebug() << "ERROR: Missing display name for " << sa.scriptName;
+
+			auto scriptName = sa.scriptName;
+			//auto menuAction = m_pToolBarContextMenu->addAction(text, this, [scriptName, this]() {
+			auto menuAction = new QCheckBox(text);
+			QWidgetAction* menuEntry = new QWidgetAction(this);
+			menuEntry->setDefaultWidget(menuAction);
+			m_pToolBarContextMenu->addAction(menuEntry);
+			connect(menuAction, &QCheckBox::clicked, this, [scriptName, this]() {
+				OnToolBarMenuItemClicked(scriptName);
+				}
+			);
+			//menuAction->setCheckable(true);
+			menuAction->setChecked(currentItems.contains(sa.scriptName));
+		}
 	}
 
 	m_pToolBar->setContextMenuPolicy(Qt::CustomContextMenu);	
 	QObject::connect(m_pToolBar, &QToolBar::customContextMenuRequested, this,
-		[m_pToolBarContextMenu, this](const QPoint& p) {
+		[&](const QPoint& p) {
 			m_pToolBarContextMenu->exec(mapToGlobal(p));
 		}
 	);
@@ -1594,11 +1603,11 @@ void CSandMan::OnMessage(const QString& MsgData)
 		QString BoxName;
 		QString CmdLine = Message.mid(4);
 
-		if (CmdLine.contains("\\start.exe", Qt::CaseInsensitive)) {
+		if (CmdLine.contains("\\start.exe", Qt::CaseInsensitive) || CmdLine.contains("\\sandman.exe", Qt::CaseInsensitive)) {
 			int pos = CmdLine.indexOf("/box:", 0, Qt::CaseInsensitive);
 			int pos2 = CmdLine.indexOf(" ", pos);
 			if (pos != -1 && pos2 != -1) {
-				BoxName = CmdLine.mid(pos + 5, pos2 - (pos + 5));
+				//BoxName = CmdLine.mid(pos + 5, pos2 - (pos + 5));
 				CmdLine = CmdLine.mid(pos2 + 1);
 			}
 		}
@@ -1624,7 +1633,7 @@ void CSandMan::OnMessage(const QString& MsgData)
 			BoxName = theAPI->GetGlobalSettings()->GetText("DefaultBox", "DefaultBox");
 
 		if (!BoxName.isEmpty())
-			RunStart(BoxName, CmdLine, false, WrkDir);
+			RunStart(BoxName == "*DFP*" ? "" : BoxName, CmdLine, false, WrkDir);
 		else
 			RunSandboxed(QStringList(CmdLine), BoxName, WrkDir);
 	}
@@ -2498,10 +2507,6 @@ void CSandMan::UpdateState()
 	m_pDisableForce->setEnabled(isConnected);
 	m_pDisableForce2->setEnabled(isConnected);
 
-	//m_pCleanUpMenu->setEnabled(isConnected);
-	//m_pCleanUpButton->setEnabled(isConnected);
-	//m_pKeepTerminated->setEnabled(isConnected);
-
 	m_pEditIni->setEnabled(isConnected);
 	if(m_pEditIni2) m_pEditIni2->setEnabled(isConnected);
 	m_pReloadIni->setEnabled(isConnected);
@@ -2509,7 +2514,7 @@ void CSandMan::UpdateState()
 
 	if (m_pNewBoxButton) m_pNewBoxButton->setEnabled(isConnected);
 	if (m_pEditIniButton) m_pEditIniButton->setEnabled(isConnected);
-	if (m_pCleanUpButton) m_pCleanUpButton->setEnabled(isConnected);
+	//if (m_pCleanUpButton) m_pCleanUpButton->setEnabled(isConnected);
 }
 
 void CSandMan::OnMenuHover(QAction* action)
@@ -2661,7 +2666,8 @@ void CSandMan::AddLogMessage(const QDateTime& TimeStamp, const QString& Message,
 	}
 
 	QTreeWidgetItem* pItem = new QTreeWidgetItem(); // Time|Message
-	pItem->setText(0, TimeStamp.toString("hh:mm:ss.zzz"));
+	pItem->setText(0, TimeStamp.toString("dd.MM.yyyy hh:mm:ss.zzz"));
+	//pItem->setToolTip(0, TimeStamp.toString("dd.MM.yyyy hh:mm:ss.zzz"));
 	pItem->setData(1, Qt::UserRole, Message);
 	m_pMessageLog->GetTree()->addTopLevelItem(pItem);
 #ifdef _DEBUG
@@ -2816,7 +2822,7 @@ void CSandMan::OnLogSbieMessage(quint32 MsgCode, const QStringList& MsgData, qui
 void CSandMan::SaveMessageLog(QIODevice* pFile)
 {
 	foreach(const SSbieMsg& Msg, m_MessageLog)
-		pFile->write((Msg.TimeStamp.toString("hh:mm:ss.zzz")  + "\t" + FormatSbieMessage(Msg.MsgCode, Msg.MsgData, Msg.ProcessName)).toLatin1() + "\n");
+		pFile->write((Msg.TimeStamp.toString("dd.MM.yyyy hh:mm:ss.zzz")  + "\t" + FormatSbieMessage(Msg.MsgCode, Msg.MsgData, Msg.ProcessName)).toLatin1() + "\n");
 }
 
 bool CSandMan::CheckCertificate(QWidget* pWidget, int iType) 
